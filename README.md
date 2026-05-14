@@ -1,75 +1,23 @@
-Automação e Validação de Chaves CT-e (SEFAZ)
-Este repositório contém um conjunto de scripts desenvolvidos para automatizar a extração de chaves de acesso de Conhecimento de Transporte Eletrônico (CT-e) de interfaces gráficas e, em seguida, consultar seus respectivos status de cancelamento diretamente no Web Service da SEFAZ (RS - V4).
+# Arquitetura e Justificativa de Configurações - Rastreador CT-e
 
-A solução é dividida em duas etapas principais:
+Este documento detalha as decisões arquiteturais e as configurações de limitação de taxa (throttling) implementadas no script `rastreador.js`. Todas as métricas foram ajustadas em resposta direta às regras de segurança do Ambiente Autorizador da SEFAZ (SVRS e Nacional) referentes ao "Consumo Indevido".
 
-Extrator (extrator.py): Script em Python para captura automatizada de tela e teclado.
+## 1. Controle Volumétrico Seguro (Pausa de 3000ms)
+- **A Regra da SEFAZ:** O Manual de Orientação do Contribuinte (MOC) estabelece um teto volumétrico estrito de 600 consultas a cada 5 minutos (300 segundos) por certificado digital. Ultrapassar esse limite gera a Rejeição 656 (Consumo Indevido).
+- **A Configuração:** `PAUSA_ENTRE_RAJADAS = 3000`
+- **Justificativa Técnica:** Ao definir um delay de 3000 milissegundos entre as rajadas de requisições, o script garante um rendimento máximo teórico de cerca de 425 a 450 requisições por 5 minutos. Isso mantém a aplicação operando com uma margem de segurança de ~25% abaixo do teto da SEFAZ, folga vital para absorver oscilações de latência da rede (jitter) sem risco de estourar a cota.
 
-Rastreador (rastreador.js): Script em Node.js para requisições em lote via SOAP utilizando certificado digital.
+## 2. Mitigação de WAF e Prevenção de DDoS (Lotes de 5 chaves)
+- **A Regra da SEFAZ:** O Web Application Firewall (WAF) dos servidores estaduais monitora anomalias de conexão na camada TCP. Picos instantâneos de dezenas/centenas de requisições na mesma fração de segundo são rotulados heurísticamente como ataque de Negação de Serviço (DDoS), resultando em corte de conexão (HTTP Erro 403 Forbidden).
+- **A Configuração:** `CHAVES_POR_RAZADA = 5`
+- **Justificativa Técnica:** O interpretador do Node.js (non-blocking I/O) poderia disparar milhares de chaves simultaneamente. A limitação artificial para apenas 5 conexões HTTPS abertas em paralelo atua como uma camuflagem de tráfego. O balanceador de carga da SEFAZ absorve 5 requests paralelos do mesmo IP como tráfego legítimo de um sistema comercial padrão, sem engatilhar os filtros de segurança primários.
 
-Pré-requisitos
-Para executar os scripts, você precisará ter instalado em sua máquina:
+## 3. Data Sanitization (Filtro Módulo 11)
+- **A Regra da SEFAZ:** Qualquer requisição cujo parâmetro XML seja inválido consome a cota de tráfego e contabiliza negativamente para a regra das 60 rejeições (looping). Mais de 60 rejeições em 5 minutos geram bloqueio.
+- **A Configuração:** Função `validarChaveSefaz()` implementada antes do loop de requisições.
+- **Justificativa Técnica:** A aplicação do algoritmo do Módulo 11 (dígito verificador) localmente na memória descarta chaves corrompidas ou mal digitadas na origem. Isso preserva 100% da cota de requisições do Web Service exclusivamente para chaves matematicamente íntegras, evitando o bloqueio por "comportamento de looping".
 
-Python 3.x
-
-Node.js (versão 14 ou superior recomendada)
-
-Certificado Digital (A1) no formato .pfx válido.
-
-Instalação e Configuração
-1. Configurando o ambiente Python (Extrator)
-Abra o terminal na pasta do projeto e instale as bibliotecas necessárias para a automação de interface:
-
-pip install pyautogui pyperclip
-
-2. Configurando o ambiente Node.js (Rastreador)
-Na mesma pasta, inicialize o projeto Node (caso ainda não exista o package.json) e instale o cliente HTTP necessário para as requisições SOAP
-
-npm init -y
-npm install axios
-
-(As bibliotecas fs e https já são nativas do Node.js).
-
-Como Executar
-Passo 1: Extração das Chaves (extrator.py)
-O script Python assume o controle do teclado para varrer campos de um sistema e copiar as chaves de 44 dígitos, salvando-as em um arquivo de texto.
-
-Configurações internas antes de rodar:
-Abra o arquivo extrator.py e ajuste as variáveis de configuração conforme a necessidade do seu sistema logístico:
-
-TOTAL_CHAVES: Quantidade de campos que o robô deve ler.
-
-TECLA_PROXIMO: Tecla utilizada para pular para o próximo campo no sistema (ex: 'tab' ou 'down').
-
-Execução:
-
-Execute o script no terminal:
-
-python extrator.py
-
-Você terá 5 segundos para clicar no primeiro campo de chave do sistema alvo.
-
-Parada de Emergência: Caso precise interromper o robô antes do fim, arraste o cursor do mouse rapidamente para qualquer um dos quatro cantos do monitor (recurso nativo do PyAutoGUI).
-
-Resultado: O script gerará um arquivo chamado chaves_limpas.txt no mesmo diretório, contendo apenas chaves válidas (44 números).
-
-Passo 2: Consulta na SEFAZ (rastreador.js)
-O script Node.js consome o arquivo gerado pelo extrator e realiza consultas assíncronas no endpoint CTeConsultaV4 da SEFAZ, utilizando o certificado digital da empresa.
-
-Configurações internas antes de rodar:
-Abra o arquivo rastreador.js e configure obrigatoriamente os seguintes campos:
-
-CAMINHO_CERTIFICADO: Caminho para o seu arquivo .pfx (ex: ./certificado.pfx).
-
-SENHA_CERTIFICADO: Senha do certificado digital.
-
-CHAVES_POR_RAZADA: Quantidade de requisições simultâneas (Cuidado com bloqueios 403 da SEFAZ, o padrão é 1).
-
-PAUSA_ENTRE_RAJADAS: Tempo de espera entre os lotes em milissegundos.
-
-Execução:
-Certifique-se de que o arquivo chaves_limpas.txt e o certificado .pfx estão no mesmo diretório do script e execute:
-
-node rastreador.js
-
-Resultado: O terminal exibirá o progresso dos lotes processados e alertará destacadamente caso encontre chaves com status 101 (Cancelamento) ou 135 (Evento registrado e vinculado a CT-e). Erros de conexão ou bloqueios (403) também serão informados no console.
+## 4. Circuit Breaker (Disjuntor de Segurança)
+- **A Regra da SEFAZ:** A punição por Consumo Indevido bloqueia o certificado no Web Service por 1 hora. Se o cliente realizar uma nova requisição durante este período, o cronômetro de 1 hora é reiniciado.
+- **A Configuração:** Interceptação dos cStats `656` e `678` com interrupção síncrona (`break`).
+- **Justificativa Técnica:** Este bloco atua como o disjuntor principal da aplicação (State Management). Ao identificar a punição ativa no parser do XML, o script aplica um `break` fatal no loop principal. Isso desliga a comunicação instantaneamente e de forma autônoma, garantindo que o software não renove a punição governamental indefinidamente.
