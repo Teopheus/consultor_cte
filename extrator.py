@@ -6,7 +6,7 @@ import time
 pyautogui.PAUSE = 0 
 
 # --- CONFIGURAÇÕES TURBO ---
-TOTAL_CHAVES = 1500
+TOTAL_CHAVES = 1500                                                                                                                              
 ATRASO_ENTRE_TECLAS = 0.01 # Apenas 10 milissegundos
 ATRASO_COPIA = 0.02        # Tempo mínimo para o Windows registrar o Ctrl+C
 TECLA_PROXIMO = 'tab'      # Mude para 'down' se o Tab pular para o lugar errado

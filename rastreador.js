@@ -9,19 +9,44 @@ const { exec } = require('child_process');
 const CAMINHO_CERTIFICADO = 'C:/Users/Thomas Albuquerque/Desktop/extrator/TRANSAGIL TRANSPORTES DE CARGA LTDA_07199061000179.pfx'; 
 const SENHA_CERTIFICADO = 'AGIL0001';      
 const ARQUIVO_CHAVES = './chaves_limpas.txt';
-const URL_SEFAZ = 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx';
 
 // ==========================================
-// 2. CONFIGURAÇÕES DE VELOCIDADE (OTIMIZADO)
+// 2. CONFIGURAÇÕES DE VELOCIDADE
 // ==========================================
-const CHAVES_POR_RAZADA = 5; // Consulta 5 chaves AO MESMO TEMPO
-const PAUSA_ENTRE_RAJADAS = 3000; // Pausa de 3 segundos entre as rajadas
+const CHAVES_POR_RAZADA = 5; 
+const PAUSA_ENTRE_RAJADAS = 3000; 
 
 const httpsAgent = new https.Agent({
     pfx: fs.readFileSync(CAMINHO_CERTIFICADO),
     passphrase: SENHA_CERTIFICADO,
     rejectUnauthorized: false
 });
+
+// ==========================================
+// FUNÇÃO: Roteador de URLs por Estado (UF)
+// ==========================================
+function obterUrlSefaz(uf) {
+    switch (uf) {
+        case '35': // SP
+        case '26': // PE
+        case '16': // AP
+        case '14': // RR
+            return 'https://nfe.fazenda.sp.gov.br/cteWEB/services/CTeConsultaV4.asmx';
+        case '31': // MG
+            return 'https://cte.fazenda.mg.gov.br/cte/services/CTeConsultaV4';
+        case '41': // PR
+            return 'https://cte.fazenda.pr.gov.br/cte/CTeConsultaV4';
+        case '43': // RS (Servidor Local, diferente do SVRS)
+            return 'https://cte.sefaz.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx';
+        case '50': // MS
+            return 'https://cte.fazenda.ms.gov.br/ws/CTeConsultaV4';
+        case '51': // MT
+            return 'https://cte.sefaz.mt.gov.br/ctews2/services/CTeConsultaV4';
+        default: 
+            // SVRS - Sefaz Virtual RS (Atende SC, RJ, CE, DF, ES, etc.)
+            return 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx';
+    }
+}
 
 // ==========================================
 // FUNÇÃO: Validador de Dígito (Módulo 11)
@@ -53,10 +78,17 @@ function montarXml(chave) {
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Função isolada para consultar UMA chave (Com Disjuntor, Alerta Sonoro e Bloco Vermelho)
+// ==========================================
+// FUNÇÃO: Consulta Individual Inteligente
+// ==========================================
 async function consultarChaveIndividual(chave) {
+    // 1. Descobre de qual estado é essa chave
+    const uf = chave.substring(0, 2);
+    // 2. Pega a URL correta para esse estado
+    const urlDestino = obterUrlSefaz(uf);
+
     try {
-        const resposta = await axios.post(URL_SEFAZ, montarXml(chave), {
+        const resposta = await axios.post(urlDestino, montarXml(chave), {
             headers: {
                 'Content-Type': 'application/soap+xml; charset=utf-8',
                 'SOAPAction': 'http://www.portalfiscal.inf.br/cte/wsdl/CTeConsultaV4/cteConsultaCT'
@@ -71,11 +103,10 @@ async function consultarChaveIndividual(chave) {
 
         // DISJUNTOR: Bloqueio de Consumo Indevido da SEFAZ
         if (status === '656' || status === '678') {
-            return { chave, status: 'erro_fatal_consumo', motivo };
+            return { chave, status: 'erro_fatal_consumo', motivo, uf };
         }
 
         if (status === '101' || status === '135') {
-            // Códigos de cor nativos do terminal (Fundo Vermelho, Texto Branco, Negrito)
             const bgRed = "\x1b[41m";
             const fgWhite = "\x1b[37m";
             const bold = "\x1b[1m";
@@ -87,28 +118,29 @@ async function consultarChaveIndividual(chave) {
             console.log(`${bgRed}${fgWhite}${bold}==============================================================${reset}`);
             console.log(`${bgRed}${fgWhite}${bold} 📄 CHAVE:  ${chave}                 ${reset}`);
             console.log(`${bgRed}${fgWhite}${bold} 📌 MOTIVO: ${status} - ${motivo.padEnd(38, ' ')}${reset}`);
+            console.log(`${bgRed}${fgWhite}${bold} 🌍 ESTADO: ${uf}                                             ${reset}`);
             console.log(`${bgRed}${fgWhite}${bold}==============================================================${reset}`);
             console.log("\n");
             
-            // Dispara um bipe no Windows
             exec('powershell.exe -c "[console]::beep(1000, 500)"');
             
             return { chave, status: 'cancelada' };
         } else if (status !== '100') {
-            console.log(`⚠️ Status ${status} - Chave ${chave} (${motivo})`);
+            console.log(`⚠️ UF ${uf} | Status ${status} - Chave ${chave} (${motivo})`);
         }
         return { chave, status: 'ok' };
 
     } catch (erro) {
         if (erro.response && erro.response.status === 403) {
-            return { chave, status: 'erro_fatal_403' };
+            return { chave, status: 'erro_fatal_403', uf };
         }
+        // Retorna o erro normal sem travar a rajada
         return { chave, status: 'erro_conexao' };
     }
 }
 
 // ==========================================
-// 3. O GERENCIADOR DE LOTE
+// 3. O GERENCIADOR DE LOTE BLINDADO
 // ==========================================
 async function iniciarTurbo() {
     console.log("Lendo e validando chaves localmente...");
@@ -118,7 +150,7 @@ async function iniciarTurbo() {
         .map(c => c.trim())
         .filter(c => c.length === 44);
 
-    // --- NOVA BLINDAGEM: Filtra as chaves inválidas matematicamente ---
+    // --- BLINDAGEM MATEMÁTICA ---
     const chaves = chavesLidas.filter(chave => {
         const ehValida = validarChaveSefaz(chave);
         if (!ehValida) {
@@ -128,14 +160,13 @@ async function iniciarTurbo() {
     });
 
     const chavesSujas = chavesLidas.length - chaves.length;
-    
     const totalLotes = Math.ceil(chaves.length / CHAVES_POR_RAZADA);
     const tempoEstimado = Math.ceil((totalLotes * PAUSA_ENTRE_RAJADAS) / 1000 / 60);
 
     console.log(`\n📁 Total original: ${chavesLidas.length}`);
     console.log(`🗑️ Chaves sujas/inválidas descartadas: ${chavesSujas}`);
     console.log(`✅ Chaves reais para consultar: ${chaves.length}`);
-    console.log(`🚀 Iniciando... (Lotes de ${CHAVES_POR_RAZADA}) | Tempo estimado: ~${tempoEstimado} minutos.\n`);
+    console.log(`🚀 Iniciando Roteador de Estados... (Lotes de ${CHAVES_POR_RAZADA}) | Tempo estimado: ~${tempoEstimado} minutos.\n`);
 
     for (let i = 0; i < chaves.length; i += CHAVES_POR_RAZADA) {
         
@@ -144,26 +175,28 @@ async function iniciarTurbo() {
 
         process.stdout.write(`Processando Lote ${numeroLoteAtual}/${totalLotes} (${loteDeChaves.length} chaves simultâneas)... `);
 
-        // Dispara todas as consultas desse lote AO MESMO TEMPO
+        // Dispara as consultas, e o código se encarrega de mandar cada uma para a UF correta
         const promessas = loteDeChaves.map(chave => consultarChaveIndividual(chave));
         const resultados = await Promise.all(promessas);
 
         // --- VERIFICAÇÃO DO DISJUNTOR ---
-        if (resultados.some(r => r.status === 'erro_fatal_consumo')) {
-            console.log("\n🛑 ALARME SEFAZ: Consumo Indevido detectado!");
+        const erroConsumo = resultados.find(r => r.status === 'erro_fatal_consumo');
+        if (erroConsumo) {
+            console.log(`\n🛑 ALARME SEFAZ: Consumo Indevido detectado no estado ${erroConsumo.uf}!`);
             console.log("🛑 SCRIPT ABORTADO PARA EVITAR PUNIÇÃO MAIOR.");
             console.log("🕒 O seu certificado está bloqueado. Aguarde EXATAMENTE 61 MINUTOS antes de rodar novamente.");
             break; 
         }
 
-        if (resultados.some(r => r.status === 'erro_fatal_403')) {
-            console.log("\n🛑 SCRIPT ABORTADO: Bloqueio 403 (IP bloqueado pelo Firewall da SEFAZ).");
+        const erro403 = resultados.find(r => r.status === 'erro_fatal_403');
+        if (erro403) {
+            console.log(`\n🛑 SCRIPT ABORTADO: Bloqueio 403 (IP bloqueado pelo Firewall do estado ${erro403.uf}).`);
             break;
         }
 
         console.log(`Concluído.`);
 
-        // Pausa entre as rajadas para esfriar o IP
+        // Pausa entre as rajadas
         await delay(PAUSA_ENTRE_RAJADAS);
     }
 
